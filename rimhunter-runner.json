@@ -1,0 +1,17 @@
+{
+  "worldSeed": "relationstab-runner-world",
+  "packageId": "rimhunter.relationstab",
+  "modAssembly": "Fluffy_Relations.dll",
+  "modProject": "Source/Fluffy_Relations.csproj",
+  "runnerProject": "TestRunner/Source/RelationsTabTestRunner.csproj",
+  "runnerPackageId": "rimhunter.relationstab.testrunner",
+  "runnerAssembly": "RelationsTabTestRunner.dll",
+  "runnerDir": "TestRunner",
+  "scenarioDirs": ["TestRunner/Source"],
+  "guiPassOnUnity": true,
+  "stageExclude": ["Source", "Tests", "scripts", "*.proj", "global.json", "LICENSE", ".gitignore", "rimhunter-runner.json", "modinfo.json", "Readme.md", "MODIFICATIONS", "CHANGELOG.md", "CONTRIBUTING.md"],
+  "extraLaunches": [
+    {"label": "factions tab started with the setting on", "command": ["scripts/test-factions-tab-startup"]},
+    {"label": "saved thresholds (two launches)", "command": ["scripts/test-saved-settings"]}
+  ]
+}

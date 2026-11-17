@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+work="$(mktemp -d "${TMPDIR:-/tmp}/relationstab-saved-settings.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+echo "launch 1: change the thresholds in the mod settings window and close it"
+"$here/scripts/run-scenarios" --windowed --work-dir "$work" -s colonist-page-thresholds-set-in-settings-are-written-to-the-file "$@"
+file="$(find "$work" -path '*/savedata/Config/Mod_rimhunter.relationstab_Controller.xml' | head -n 1)"
+[ -n "$file" ] || { echo "test-saved-settings: launch 1 left no settings file under $work" >&2; exit 1; }
+echo "launch 2: start the game again with the file launch 1 wrote and read the lines"
+"$here/scripts/run-scenarios" --windowed --work-dir "$work" --seed-config "$file:Mod_rimhunter.relationstab_Controller.xml" -s colonist-page-saved-thresholds-apply-after-restart "$@"

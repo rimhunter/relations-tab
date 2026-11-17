@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+shared="$here/TestRunner/shared"
+[ -x "$shared/bin/test-crash-report" ] || { echo "test-crash-report: the shared runner is missing; run: git submodule update --init" >&2; exit 4; }
+export RIMHUNTER_MOD_REPO="$here"
+exec "$shared/bin/test-crash-report" "$@"

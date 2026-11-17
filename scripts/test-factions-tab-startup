@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fx="$here/TestRunner/Fixtures/factions-tab"
+name="Mod_rimhunter.relationstab_Controller.xml"
+exec "$here/scripts/run-scenarios" "$@" --windowed -s factions-tab-kept-in-a-game-started-with-the-setting-on --seed-config "$fx/$name:$name"

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import argparse, io, json, os, re, shutil, subprocess, sys, tarfile, tempfile, zipfile
+
+GITHUB_REPO = "rimhunter/relations-tab"
+AUTHOR_NAME = "Chris Thompson"
+AUTHOR_EMAIL = "348801+ChrisThompsonTLDR@users.noreply.github.com"
+EXCLUDED = (".gitea", ".gitmodules", "TestRunner/shared")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def die(message):
+    sys.exit("publish-github: " + message)
+
+
+def run(args, cwd=None, env=None, input=None):
+    result = subprocess.run(args, cwd=cwd, env=env, input=input, capture_output=True)
+    if result.returncode != 0:
+        die("%s failed (exit %d): %s" % (" ".join(args[:3]), result.returncode,
+                                         result.stderr.decode("utf-8", "replace").strip()))
+    return result.stdout
+
+
+def git(repo, *args, env=None, input=None):
+    return run(["git", "-C", repo, *args], env=env, input=input).decode("utf-8", "replace")
+
+
+def is_excluded(path):
+    return any(path == e or path.startswith(e + "/") for e in EXCLUDED)
+
+
+def commit_blobs(repo, commit):
+    blobs = {}
+    out = run(["git", "-C", repo, "ls-tree", "-r", "-z", "--full-tree", commit])
+    for entry in out.split(b"\0"):
+        if not entry:
+            continue
+        meta, path = entry.decode().split("\t", 1)
+        mode, kind, sha = meta.split()
+        if is_excluded(path):
+            continue
+        if kind != "blob":
+            die("unexpected %s entry outside the excluded paths: %s" % (kind, path))
+        blobs[path] = (mode, sha)
+    return blobs
+
+
+def build_public_tree(repo, commit, dest):
+    if os.path.exists(dest):
+        die("destination exists: " + dest)
+    os.makedirs(dest)
+    archive = run(["git", "-C", repo, "archive", "--format=tar", commit])
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(dest, filter="tar")
+    for excluded in EXCLUDED:
+        target = os.path.join(dest, excluded)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        elif os.path.lexists(target):
+            os.remove(target)
+    return sorted(
+        os.path.relpath(os.path.join(d, f), dest)
+        for d, _, files in os.walk(dest) for f in files)
+
+
+def verify_tree(repo, commit, dest):
+    expected = commit_blobs(repo, commit)
+    actual = sorted(
+        os.path.relpath(os.path.join(d, f), dest)
+        for d, _, files in os.walk(dest) for f in files)
+    problems = []
+    for path in sorted(set(actual) - set(expected)):
+        problems.append("extra in public tree: " + path)
+    for path in sorted(set(expected) - set(actual)):
+        problems.append("missing from public tree: " + path)
+    for path in sorted(set(actual) & set(expected)):
+        sha = run(["git", "hash-object", os.path.join(dest, path)]).decode().strip()
+        if sha != expected[path][1]:
+            problems.append("blob differs: " + path)
+    if problems:
+        die("public tree does not match the Gitea commit:\n  " + "\n  ".join(problems))
+    return len(expected)
+
+
+def author_env():
+    env = dict(os.environ)
+    for role in ("AUTHOR", "COMMITTER"):
+        env["GIT_%s_NAME" % role] = AUTHOR_NAME
+        env["GIT_%s_EMAIL" % role] = AUTHOR_EMAIL
+    return env
+
+
+def add_all_explicitly(work, files):
+    git(work, "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul",
+        input=("\0".join(files) + "\0").encode())
+
+
+def commit_public(work, message, env):
+    git(work, "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message, env=env)
+    return git(work, "rev-parse", "HEAD").strip()
+
+
+def verify_commit(work, rev, repo, commit):
+    expected = commit_blobs(repo, commit)
+    got = {}
+    out = run(["git", "-C", work, "ls-tree", "-r", "-z", "--full-tree", rev])
+    for entry in out.split(b"\0"):
+        if entry:
+            meta, path = entry.decode().split("\t", 1)
+            mode, kind, sha = meta.split()
+            got[path] = (mode, sha)
+    if got != expected:
+        diff = sorted(set(got.items()) ^ set(expected.items()))
+        die("public commit %s differs from the Gitea commit in %d entries, first: %s"
+            % (rev[:10], len(diff), diff[0]))
+    for field in ("an", "ae", "cn", "ce"):
+        value = git(work, "log", "-1", "--format=%" + field, rev).strip()
+        want = AUTHOR_NAME if field.endswith("n") else AUTHOR_EMAIL
+        if value != want:
+            die("public commit %s has %s %r, expected %r" % (rev[:10], field, value, want))
+    return len(got)
+
+
+def changelog_notes(repo, commit, version):
+    text = git(repo, "show", "%s:CHANGELOG.md" % commit)
+    match = re.search(r"^## %s \(\d{4}-\d{2}-\d{2}\)\n(.*?)(?=^## |\Z)" % re.escape(version),
+                      text, re.S | re.M)
+    if not match:
+        die("CHANGELOG.md has no '## %s (date)' section at %s" % (version, commit[:10]))
+    return match.group(0).rstrip() + "\n"
+
+
+def about_version(repo, commit):
+    xml = git(repo, "show", "%s:About/About.xml" % commit)
+    match = re.search(r"<modVersion>([^<]+)</modVersion>", xml)
+    if not match:
+        die("About.xml has no modVersion")
+    return match.group(1)
+
+
+def gh_repo_exists():
+    result = subprocess.run(["gh", "repo", "view", GITHUB_REPO, "--json", "name"], capture_output=True)
+    return result.returncode == 0
+
+
+def zip_mod_folder(folder, zip_path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for d, _, files in os.walk(folder):
+            for f in sorted(files):
+                full = os.path.join(d, f)
+                z.write(full, os.path.join("rimhunter.relationstab", os.path.relpath(full, folder)))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Publish a Gitea release commit to the public GitHub repository.")
+    parser.add_argument("tag", help="release tag, for example v4.1.0")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build and verify the public tree and print the plan; never touch GitHub")
+    args = parser.parse_args()
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", args.tag):
+        die("tag must look like v4.1.0")
+    version = args.tag[1:]
+
+    commit = git(ROOT, "rev-parse", "HEAD").strip()
+    if git(ROOT, "status", "--porcelain", "--untracked-files=no").strip():
+        die("working tree has uncommitted changes to tracked files")
+    if about_version(ROOT, commit) != version:
+        die("About.xml modVersion %s does not match tag %s" % (about_version(ROOT, commit), args.tag))
+    notes = changelog_notes(ROOT, commit, version)
+
+    scratch = tempfile.mkdtemp(prefix="publish-github-")
+    try:
+        public = os.path.join(scratch, "public")
+        files = build_public_tree(ROOT, commit, public)
+        count = verify_tree(ROOT, commit, public)
+        print("public tree: %d files, every blob hash equals Gitea commit %s" % (count, commit[:10]))
+        print("left out: " + ", ".join(EXCLUDED))
+
+        work = os.path.join(scratch, "work")
+        os.makedirs(work)
+        git(work, "init", "-q", "-b", "main")
+        env = author_env()
+        base = commit_public(work, "chore: initialize repository", env)
+        git(work, "switch", "-q", "-c", "release/" + args.tag)
+        for f in files:
+            dst = os.path.join(work, f)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(public, f), dst)
+        add_all_explicitly(work, files)
+        release = commit_public(work, "release: %s" % args.tag, env)
+        entries = verify_commit(work, release, ROOT, commit)
+        print("release commit %s: %d entries, author and committer %s <%s>" % (release[:10], entries, AUTHOR_NAME, AUTHOR_EMAIL))
+
+        if args.dry_run:
+            exists = gh_repo_exists()
+            print("dry run: nothing is pushed. A real run would:")
+            print("  1. %s github.com/%s (public)" % ("find the existing repository" if exists else "create", GITHUB_REPO))
+            print("  2. push an empty first commit to main (only if main does not exist yet)")
+            print("  3. push the release commit as release/%s" % args.tag)
+            print("  4. open a pull request release/%s -> main with gh pr create" % args.tag)
+            print("  5. fast-forward main to the release commit, delete release/%s" % args.tag)
+            print("  6. tag %s on the release commit and push the tag" % args.tag)
+            print("  7. run scripts/package, zip it as rimhunter.relationstab-%s.zip, and create the GitHub release with this CHANGELOG section as notes:" % args.tag)
+            print("-----")
+            print(notes, end="")
+            print("-----")
+            return
+
+        if git(ROOT, "branch", "-r", "--contains", commit, "--list", "origin/main").strip() == "":
+            die("HEAD is not on origin/main; publish only a merged commit")
+
+        if not gh_repo_exists():
+            run(["gh", "repo", "create", GITHUB_REPO, "--public", "--description",
+                 "Relations Tab (rimhunter): Fluffy's Relations Tab for RimWorld 1.6 and 1.7"])
+        remote = os.path.join(scratch, "remote")
+        run(["gh", "repo", "clone", GITHUB_REPO, remote])
+        git(remote, "config", "user.name", AUTHOR_NAME)
+        git(remote, "config", "user.email", AUTHOR_EMAIL)
+        has_main = subprocess.run(["git", "-C", remote, "rev-parse", "--verify", "-q", "origin/main"],
+                                  capture_output=True).returncode == 0
+        if not has_main:
+            git(remote, "switch", "-q", "-c", "main")
+            commit_public(remote, "chore: initialize repository", env)
+            git(remote, "push", "-q", "origin", "main")
+        else:
+            git(remote, "switch", "-q", "-C", "main", "origin/main")
+        git(remote, "switch", "-q", "-c", "release/" + args.tag)
+        git(remote, "rm", "-q", "-r", "--ignore-unmatch", "--", ".")
+        for f in files:
+            dst = os.path.join(remote, f)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(public, f), dst)
+        add_all_explicitly(remote, files)
+        release = commit_public(remote, "release: %s" % args.tag, env)
+        verify_commit(remote, release, ROOT, commit)
+        git(remote, "push", "-q", "origin", "release/" + args.tag)
+        run(["gh", "pr", "create", "--repo", GITHUB_REPO, "--base", "main", "--head", "release/" + args.tag,
+             "--title", "Release %s" % args.tag, "--body", notes])
+        git(remote, "push", "-q", "origin", "%s:refs/heads/main" % release)
+        git(remote, "push", "-q", "origin", "--delete", "release/" + args.tag)
+        git(remote, "tag", args.tag, release)
+        git(remote, "push", "-q", "origin", args.tag)
+
+        git(remote, "fetch", "-q", "origin")
+        verify_commit(remote, "origin/main", ROOT, commit)
+        if git(remote, "rev-parse", "origin/main").strip() != release:
+            die("GitHub main is not the release commit")
+        print("GitHub main %s equals Gitea commit %s, file by file" % (release[:10], commit[:10]))
+
+        pkg = os.path.join(scratch, "rimhunter.relationstab")
+        run([os.path.join(ROOT, "scripts", "package"), pkg])
+        zip_path = os.path.join(scratch, "rimhunter.relationstab-%s.zip" % args.tag)
+        zip_mod_folder(pkg, zip_path)
+        notes_path = os.path.join(scratch, "notes.md")
+        with open(notes_path, "w") as f:
+            f.write(notes)
+        run(["gh", "release", "create", args.tag, zip_path, "--repo", GITHUB_REPO, "--verify-tag",
+             "--title", "Relations Tab (rimhunter) %s" % version, "--notes-file", notes_path])
+        view = json.loads(run(["gh", "release", "view", args.tag, "--repo", GITHUB_REPO, "--json", "assets,tagName"]))
+        names = [a["name"] for a in view["assets"]]
+        if os.path.basename(zip_path) not in names:
+            die("release has no zip asset: %s" % names)
+        print("release %s lists %s" % (view["tagName"], ", ".join(names)))
+        print("Gitea tag still to create: %s on %s" % (args.tag, commit))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

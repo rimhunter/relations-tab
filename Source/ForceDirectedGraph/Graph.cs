@@ -1,0 +1,228 @@
+// Karel Kroeze
+// Graph.cs
+// 2016-12-26
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using UnityEngine;
+using Verse;
+
+namespace Fluffy_Relations.ForceDirectedGraph {
+    public class Graph {
+        #region Fields
+
+        public static float MAX_TEMPERATURE = .05f;
+        public static float REPULSIVE_CONSTANT = 5000f;
+        public static float ATTRACTIVE_CONSTANT = .2f;
+        public static float CENTRAL_CONSTANT = .5f;
+        public static int MAX_ITERATIONS = 2000;
+        public static float THRESHOLD = .02f;
+
+        public bool done;
+        private readonly List<Edge> edges = new();
+        public static float idealDistance;
+        private int iteration = 1;
+        public List<Node> nodes = new();
+        private readonly Dictionary<Node, List<Node>> connections = new();
+        public Vector2 size;
+        private float temperature = .1f;
+        private readonly Dictionary<Pawn, Node> _pawnNodes = new();
+
+#if DEBUG_GRAPH
+        public static StringBuilder msg = new();
+#endif
+
+        #endregion Fields
+
+        public void Restart() {
+            done = false;
+            iteration = 1;
+        }
+
+        public Vector2 Center => size / 2f;
+
+        public float Density { get; private set; } = 1f;
+        public float RepulsionScale { get; private set; } = 1f;
+        public float AttractionScale { get; private set; } = 1f;
+
+        public List<Node> Connections(Node node) {
+            if (!connections.ContainsKey(node)) {
+                connections.Add(node, new List<Node>());
+            }
+
+            return connections[node];
+        }
+
+        #region Constructors
+
+        public Graph(Vector2 size) {
+            this.size = size;
+        }
+
+        #endregion Constructors
+
+        #region Methods
+
+        public void AddEdge<T>(Node nodeA, Node nodeB) where T : Edge {
+            if (
+                nodeA != null &&
+                nodeB != null &&
+                nodeA != nodeB &&
+                !Connections(nodeA).Contains(nodeB)) {
+                edges.Add((T) Activator.CreateInstance(typeof(T), nodeA, nodeB));
+                Connections(nodeA).Add(nodeB);
+                Connections(nodeB).Add(nodeA);
+            }
+        }
+
+        public void Draw(Rect canvas) {
+            GUI.BeginGroup(canvas);
+            foreach (Edge edge in edges) {
+                edge.Draw();
+            }
+
+            foreach (Node node in nodes) {
+                node.Draw();
+            }
+
+            GUI.EndGroup();
+        }
+
+        public Node Node(Pawn pawn) {
+            if (pawn == null) {
+                return null;
+            }
+
+            if (!_pawnNodes.TryGetValue(pawn, out Node node)) {
+                node = nodes.FirstOrDefault(n => n.pawn == pawn);
+                if (node == null) {
+                    return node;
+                }
+
+                _pawnNodes.Add(pawn, node);
+            }
+
+            return node;
+        }
+
+        public void ClearEdges() {
+            edges.Clear();
+            connections.Clear();
+        }
+
+        public void Update() {
+            // check if done
+            if (done || iteration > MAX_ITERATIONS || !nodes.Any(node => !node.Frozen)) {
+                if (!done) {
+                    done = true;
+                }
+
+                return;
+            }
+
+#if DEBUG_GRAPH
+            msg = new StringBuilder();
+            msg.AppendLine("Iteration: " + iteration);
+#endif
+
+            // prepare iteration global vars, nodes and edges.
+            PrepareNextIteration();
+
+            // calculate attractive forces
+            foreach (Edge edge in edges) {
+#if DEBUG_GRAPH
+                msg.AppendLine("\tAttractive force between " + edge.nodeA.pawn.Name.ToStringShort + edge.nodeA.position + " and " + edge.nodeB.pawn.Name.ToStringShort + edge.nodeB.position);
+#endif
+                edge.nodeA.AttractedTo(edge.nodeB);
+                edge.nodeB.AttractedTo(edge.nodeA);
+            }
+
+            // calculate repulsive forces
+            foreach (Node node in nodes) {
+#if DEBUG_GRAPH
+                msg.AppendLine("\tRepulsion for " + node.pawn.Name.ToStringShort + node.position);
+#endif
+                foreach (Node other in nodes) {
+                    if (node != other) {
+                        node.RepulsedBy(other);
+                    }
+                }
+            }
+
+            // update node positions
+            float stepCap = LayoutMath.StepCap(temperature, MAX_TEMPERATURE, Constants.SlotSize);
+            done = true;
+            foreach (Node node in nodes) {
+                // central gravitational force
+                node.velocity +=
+                    CENTRAL_CONSTANT * // constant
+                    (node.position.DistanceTo(Center) + // base term
+                      Mathf.Pow(Mathf.Max(node.position.DistanceTo(Center) - size.magnitude, 0f), 2)) *
+                    // additional squared force on node far away
+                    node.position.DirectionTo(Center); // apply direction
+
+                // dampen velocities
+                node.velocity *= temperature;
+
+                // if any magnitude is greater than 1, we're not done yet.
+                if (done && !node.Frozen && node.velocity.sqrMagnitude > THRESHOLD * Density * Density) {
+                    done = false;
+                }
+
+                // physics!
+                if (!node.Frozen) {
+                    var (stepX, stepY) = LayoutMath.CapStep(node.velocity.x, node.velocity.y, stepCap);
+                    node.velocity = new Vector2(stepX, stepY);
+                    node.position += node.velocity;
+                }
+            }
+
+            // tidy up
+            Vector2 graphCentre = new(
+                                          ((nodes.Where(n => !n.Frozen).Max(node => node.position.x) -
+                                            nodes.Where(n => !n.Frozen).Min(node => node.position.x)) / 2f) +
+                                          nodes.Where(n => !n.Frozen).Min(node => node.position.x),
+                                          ((nodes.Where(n => !n.Frozen).Max(node => node.position.y) -
+                                            nodes.Where(n => !n.Frozen).Min(node => node.position.y)) / 2f) +
+                                          nodes.Where(n => !n.Frozen).Min(node => node.position.y));
+            Vector2 offset = (size / 2f) - graphCentre;
+
+#if DEBUG_GRAPH
+            msg.AppendLine("Centre: " + graphCentre + ", offset: " + (size / 2f));
+#endif
+            foreach (Node node in nodes) {
+                // move to true center
+                if (!node.Frozen) {
+                    node.position += offset;
+                }
+
+                node.Clamp(size);
+
+#if DEBUG_GRAPH
+                msg.AppendLine("\t" + node.pawn.LabelShort + ", velocity: " + node.velocity + ", position: " + node.position);
+            }
+            Log.Message(msg.ToString());
+#else
+            }
+#endif
+            iteration++;
+        }
+
+        private void PrepareNextIteration() {
+            // set iteration vars
+            idealDistance = LayoutMath.IdealDistance(size.x, size.y, nodes.Count, Constants.SlotSize);
+            Density = LayoutMath.Density(nodes.Count);
+            RepulsionScale = LayoutMath.RepulsionScale(Density);
+            AttractionScale = LayoutMath.AttractionScale(Density);
+            temperature = MAX_TEMPERATURE * (1f - ((float) iteration / MAX_ITERATIONS));
+
+#if DEBUG_GRAPH
+            msg.AppendLine("idealDistance: " + idealDistance + ", temperature: " + temperature);
+#endif
+        }
+
+        #endregion Methods
+    }
+}

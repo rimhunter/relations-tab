@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+import sys
+from PIL import Image
+
+CROP = (1450, 650, 2730, 1370)
+OUT = (1024, 576)
+
+if len(sys.argv) != 3:
+    sys.exit("usage: scripts/make-preview FULL_SIZE_SCREENSHOT.png About/Preview.png")
+src = Image.open(sys.argv[1])
+if src.size != (2880, 1800):
+    sys.exit("expected the 2880x1800 full-size screenshot of screenshot-preview-image-source taken on lin, got %dx%d" % src.size)
+src.convert("RGB").crop(CROP).resize(OUT, Image.LANCZOS).save(sys.argv[2], optimize=True)

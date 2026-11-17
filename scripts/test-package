@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$here"
+out="$(mktemp -d)"
+trap 'rm -rf "$out"' EXIT
+fail=0
+if ! scripts/package --no-build "$out/pkg" >/dev/null; then
+  echo "FAIL package"
+  exit 1
+fi
+for p in About/About.xml About/Preview.png LoadFolders.xml LICENSE MODIFICATIONS CHANGELOG.md 1.6/Assemblies/Fluffy_Relations.dll 1.7/Assemblies/Fluffy_Relations.dll Source/Fluffy_Relations.csproj Defs/MainButtonDefs/RelationsTab.xml; do
+  if [ ! -f "$out/pkg/$p" ]; then
+    echo "FAIL missing $p"
+    fail=1
+  fi
+done
+for p in Source/Images Source/preview.png Source/preview.svg.bak About/PublishedFileId.txt About/Manifest.xml modinfo.json TestRunner Tests scripts obj bin .git .gitea .gitmodules rimhunter-runner.json Build.proj global.json Assemblies; do
+  if [ -e "$out/pkg/$p" ]; then
+    echo "FAIL unexpected $p"
+    fail=1
+  fi
+done
+dlls="$(find "$out/pkg" -type f -name '*.dll')"
+while IFS= read -r f; do
+  case "$f" in
+    "") ;;
+    "$out/pkg/1.6/Assemblies/Fluffy_Relations.dll" | "$out/pkg/1.7/Assemblies/Fluffy_Relations.dll") ;;
+    *) echo "FAIL unexpected $f"; fail=1 ;;
+  esac
+done <<<"$dlls"
+grep_status=0
+mentions="$(grep -rIl 'TestRunner\|rimhunter.relationstab.testrunner' "$out/pkg")" || grep_status=$?
+case "$grep_status" in
+  0) echo "FAIL runner mentioned in package: $mentions"; fail=1 ;;
+  1) ;;
+  *) echo "FAIL searching the package for the runner (grep exit $grep_status)"; exit 1 ;;
+esac
+if [ "$fail" != 0 ]; then
+  exit 1
+fi
+echo "PASS package holds neither the runner nor the tests"

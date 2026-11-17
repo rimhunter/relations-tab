@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+build=1
+if [ "${1:-}" = "--no-build" ]; then build=0; shift; fi
+out="${1:-$here/dist/rimhunter.relationstab}"
+
+if [ "$build" = 1 ]; then
+  "$HOME/.dotnet/dotnet" build "$here/Build.proj" >&2
+fi
+
+for v in 1.6 1.7; do
+  [ -f "$here/$v/Assemblies/Fluffy_Relations.dll" ] || { echo "package: $v/Assemblies/Fluffy_Relations.dll is missing; build first" >&2; exit 4; }
+done
+
+
+case "$out" in ""|/|"$HOME"|"$here") echo "package: refusing output folder '$out'" >&2; exit 4;; esac
+rm -rf "$out"
+mkdir -p "$out"
+
+cp -r "$here/About" "$here/Defs" "$here/Languages" "$here/Textures" "$out/"
+cp "$here/LoadFolders.xml" "$here/LICENSE" "$here/MODIFICATIONS" "$here/CHANGELOG.md" "$out/"
+for v in 1.6 1.7; do
+  mkdir -p "$out/$v/Assemblies"
+  cp "$here/$v/Assemblies/Fluffy_Relations.dll" "$out/$v/Assemblies/"
+done
+mkdir -p "$out/Source"
+(cd "$here/Source" && find . \( -name bin -o -name obj -o -name Images \) -prune -o -type f ! -name '*.bak' ! -name 'preview.png' -print0 | xargs -0 cp --parents -t "$out/Source")
+
+(cd "$out" && find . -type f | sort | sed 's|^\./||')

@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$here"
+for v in 1.6 1.7; do
+  [ -f "$v/Assemblies/Fluffy_Relations.dll" ] || { echo "build both versions first (dotnet build Build.proj): $v/Assemblies/Fluffy_Relations.dll is missing" >&2; exit 4; }
+done
+git rev-parse -q --verify v4.1.124 >/dev/null || { echo "tag v4.1.124 (Fluffy's last release) is missing; fetch tags" >&2; exit 4; }
+fail=0
+check() {
+  local out
+  if out="$("${@:2}" 2>&1)"; then echo "PASS $1"; else echo "FAIL $1"; [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/    /'; fail=1; fi
+}
+upstream() { git show "v4.1.124:$1"; }
+
+about_ok() {
+  python3 -I - About/About.xml <<'PY'
+import sys, xml.etree.ElementTree as ET
+r = ET.parse(sys.argv[1]).getroot()
+t = lambda p: r.findtext(p)
+assert t("name") == "Relations Tab (rimhunter)"
+assert t("packageId") == "rimhunter.relationstab"
+assert t("author") == "Fluffy, rimhunter"
+assert t("modVersion") == "4.2.0"
+assert t("url") == "https://github.com/rimhunter/relations-tab"
+assert [e.text for e in r.findall("supportedVersions/li")] == ["1.6", "1.7"]
+assert r.find("modDependencies") is None and r.find("loadAfter") is None and r.find("loadBefore") is None
+assert sorted(e.text.lower() for e in r.findall("incompatibleWith/li")) == ["ckvam.relationstab.separatebutton", "fluffy.fluffyrelations", "jia.relationstablanguage"]
+d = t("description")
+for need in ("Fluffy", "https://github.com/rimhunter/relations-tab", "MIT", "CC-BY-SA 4.0"):
+    assert need in d, need
+PY
+}
+license_unchanged() { upstream LICENSE | cmp - LICENSE; }
+modifications_ok() {
+  grep -qxF "Modifications Copyright 2026 rimhunter, under the same MIT and CC-BY-SA 4.0 terms" MODIFICATIONS
+}
+changelog_ok() {
+  grep -qE '^- [0-9]{4}-[0-9]{2}-[0-9]{2}: ' CHANGELOG.md &&
+  grep -q 'v4.1.124' CHANGELOG.md &&
+  grep -qE '^## (Unreleased|[0-9]+\.[0-9]+\.[0-9]+ \([0-9]{4}-[0-9]{2}-[0-9]{2}\))' CHANGELOG.md &&
+  ! grep -qE '^- [^0-9]' CHANGELOG.md &&
+  grep -qi 'identity\|packageId' CHANGELOG.md &&
+  grep -qi 'translation' CHANGELOG.md &&
+  grep -qi 'preview' CHANGELOG.md
+}
+languages_ok() {
+  python3 -I - "$here" <<'PY'
+import sys, re, glob, os, subprocess, xml.etree.ElementTree as ET
+root = sys.argv[1]
+def git(*a): return subprocess.run(["git", "-C", root, *a], check=True, capture_output=True).stdout
+def entries(xml):
+    r = ET.fromstring(xml)
+    return {e.tag: (e.text or "") for e in r}
+old = {}
+for path in git("ls-tree", "-r", "--name-only", "v4.1.124", "Languages").decode().split("\n"):
+    if not path.endswith(".xml") or path.endswith("LanguageInfo.xml"): continue
+    parts = path.split("/")
+    lang = parts[1]
+    k = (lang, "DefInjected") if parts[2] == "DefInjected" else (lang, "Keyed")
+    old.setdefault(k, {}).update(entries(git("show", "v4.1.124:" + path)))
+new = {}
+for f in glob.glob(root + "/Languages/*/*/**/*.xml", recursive=True):
+    parts = os.path.relpath(f, root).split("/")
+    assert parts[2] in ("Keyed", "DefInjected"), "file outside a folder the game loads: " + f
+    if parts[2] == "DefInjected":
+        assert len(parts) >= 5 and parts[3] == "MainButtonDef", "DefInjected file outside a def type folder the game knows: " + f
+        k = (parts[1], "DefInjected")
+    else:
+        k = (parts[1], "Keyed")
+    new.setdefault(k, {}).update(entries(open(f, "rb").read()))
+for k, v in old.items():
+    assert k in new, "lost " + str(k)
+    for tag, text in v.items():
+        if k == ("English", "Keyed") and tag == "Fluffy_Relations": text = "Relations Tab (rimhunter)"
+        if k[1] == "DefInjected": tag = tag.replace("Factions.", "RelationsTab.", 1)
+        assert new[k].get(tag) == text, "key lost or changed: %s %s" % (k, tag)
+langs = {k[0] for k in old}
+assert langs == {"ChineseSimplified", "ChineseTraditional", "English", "French", "German", "Korean", "PortugueseBrazilian", "Spanish", "SpanishLatin"}, sorted(langs)
+english = new[("English", "Keyed")]
+used = set()
+for f in glob.glob(root + "/Source/**/*.cs", recursive=True):
+    used |= set(re.findall(r'"([A-Za-z0-9_.]+)"\s*\.Translate', open(f, encoding="utf-8-sig").read()))
+vanilla = {"ProblemSavingFile", "UnchosenStuff", "Certainty", "HostileTo", "Nobody"}
+not_in_english_yet = set()
+missing = sorted(used - vanilla - not_in_english_yet - set(english))
+assert not missing, "keys used in code with no English text (add them, or list them in not_in_english_yet): %s" % missing
+PY
+}
+drawn_text_ok() {
+  python3 -I - "$here" <<'PY'
+import sys, re, glob
+root = sys.argv[1]
+lit = re.compile(r'\$"(?:[^"\\{]|\\.|\{[^{}]*\})*"|"(?:[^"\\]|\\.)*"')
+allowed_statement = re.compile(r'Scribe_\w+\.Look|ContentFinder|\bLog\.\w+|\.AppendLine|Exception\(|\bthrow\b|GetNamedSilentFail|QueueLongEvent|\bnameof\b')
+bad = []
+for f in sorted(glob.glob(root + "/Source/**/*.cs", recursive=True)):
+    text = open(f, encoding="utf-8-sig").read()
+    text = re.sub(r'//[^\n]*', lambda m: " " * len(m.group(0)), text)
+    masked = lit.sub(lambda m: "S" * len(m.group(0)), text)
+    for m in lit.finditer(text):
+        literal = m.group(0)
+        shown = re.sub(r'\{[^{}]*\}', "", literal) if literal.startswith("$") else literal
+        if not re.search(r'[A-Za-z]{2}', re.sub(r'\\.', "", shown)):
+            continue
+        if re.match(r'\s*\.Translate', text[m.end():]):
+            continue
+        start = max(masked.rfind(c, 0, m.start()) for c in ";{}")
+        if allowed_statement.search(masked[start + 1:m.start()] + text[start + 1:m.end()]):
+            continue
+        line = text.count("\n", 0, m.start()) + 1
+        bad.append("%s:%d %s" % (f.replace(root + "/", ""), line, literal))
+assert not bad, "string literal in Source that is not a translation key or a known non-drawn use: %s" % bad
+PY
+}
+preview_ok() {
+  python3 -I - "$here" <<'PY'
+import sys, hashlib, subprocess, struct
+root = sys.argv[1]
+old = subprocess.run(["git", "-C", root, "show", "v4.1.124:About/Preview.png"], check=True, capture_output=True).stdout
+new = open(root + "/About/Preview.png", "rb").read()
+assert new[:8] == b"\x89PNG\r\n\x1a\n"
+w, h = struct.unpack(">II", new[16:24])
+assert w * 9 == h * 16 and w >= 640, (w, h)
+assert len(new) < 1024 * 1024, len(new)
+assert hashlib.sha256(old).digest() != hashlib.sha256(new).digest()
+PY
+}
+copyright_ok() {
+  python3 -I - "$here" <<'PY'
+import sys, subprocess
+root = sys.argv[1]
+def git(*a): return subprocess.run(["git", "-C", root, *a], check=True, capture_output=True).stdout.decode("utf-8", "replace")
+checked = 0
+for path in git("ls-tree", "-r", "--name-only", "v4.1.124", "Source").splitlines():
+    lines = [l.strip() for l in git("show", "v4.1.124:" + path).splitlines() if "Copyright Karel Kroeze" in l]
+    if not lines: continue
+    current = {l.strip() for l in open(root + "/" + path, encoding="utf-8-sig", errors="replace").read().splitlines()}
+    for l in lines:
+        assert l in current, "%s: %s" % (path, l)
+        checked += 1
+assert checked >= 1, checked
+PY
+}
+workshop_ok() {
+  python3 -I - WORKSHOP.md <<'PY'
+import sys, re
+raw = open(sys.argv[1], encoding="utf-8").read()
+assert raw.count("\n---\n") >= 1
+body = raw.split("\n---\n", 1)[1]
+for i, line in enumerate(body.split("\n")):
+    assert not re.match(r"\s*(#{1,6}\s|[-*+]\s|\d+\.\s|>\s|```)", line), "markdown at line %d: %s" % (i, line)
+assert "**" not in body and "](" not in body and "`" not in body and "__" not in body
+tags = re.findall(r"\[(/?)([a-z0-9]+)(?:=[^\]]*)?\]", body)
+allowed = {"h1", "h2", "h3", "b", "i", "u", "strike", "spoiler", "noparse", "hr", "url", "list", "olist", "quote", "code", "table", "tr", "th", "td", "img", "p", "*"}
+stack = []
+for close, name in tags:
+    assert name in allowed, "unknown tag " + name
+    if name in ("hr", "*"): continue
+    if close:
+        assert stack and stack.pop() == name, "unbalanced " + name
+    else:
+        stack.append(name)
+assert not stack, stack
+low = body.lower()
+need = [
+    "continuation of fluffy's relations tab",
+    "https://steamcommunity.com/sharedfiles/filedetails/?id=709317151",
+    "https://github.com/fluffy-mods/relationstab",
+    "https://github.com/rimhunter/relations-tab",
+    "https://github.com/rimhunter/relations-tab/issues",
+    "copyright 2020 fluffy",
+    "mit",
+    "cc-by-sa 4.0",
+    "claims no ownership of the original",
+    "taken down or handed back at fluffy's request",
+    "accepts no donations",
+    "unsubscribe",
+    "fluffy.fluffyrelations", "ckvam.relationstab.separatebutton", "jia.relationstablanguage",
+    "709317151", "3575145343", "3737801556", "3470086716", "relations tab language",
+    "buttons that other mods add to the vanilla factions screen", "vfe classical",
+    "relations tab (continued)", "relations tab - separate button",
+    "more faction interaction",
+    "keep the vanilla factions tab",
+    "not endorsed by ludeon",
+]
+for n in need:
+    assert n.lower() in low, "missing: " + n
+assert "patreon" not in low and "ko-fi" not in low and "paypal" not in low and "buy me a coffee" not in low
+PY
+}
+package_ok() {
+  local out rc=0; out="$(mktemp -d)"
+  package_check "$out" || rc=1
+  rm -rf "$out"
+  return $rc
+}
+package_check() {
+  local out="$1"
+  scripts/package --no-build "$out/pkg" >/dev/null || return 1
+  for p in About/About.xml About/Preview.png LICENSE MODIFICATIONS CHANGELOG.md Source/Fluffy_Relations.csproj Source/Controller.cs \
+           Languages/English/Keyed/Keys.xml Languages/PortugueseBrazilian/Keyed/Keys.xml; do
+    [ -f "$out/pkg/$p" ] || { echo "missing $p"; return 1; }
+  done
+  for p in TestRunner Tests scripts WORKSHOP.md modinfo.json Readme.md Source/preview.png Source/Images About/PublishedFileId.txt About/Manifest.xml; do
+    [ -e "$out/pkg/$p" ] && { echo "unexpected $p"; return 1; }
+  done
+  local f
+  f="$(find "$out/pkg" -name PublishedFileId.txt)"
+  [ -z "$f" ] || { echo "PublishedFileId.txt shipped: $f"; return 1; }
+  local banned h
+  banned="$(banned_image_hashes)"
+  [ -n "$banned" ] || { echo "found no images to ban in v4.1.124"; return 1; }
+  while IFS= read -r f; do
+    h="$(sha256sum "$f" | cut -d' ' -f1)"
+    grep -qx "$h" <<<"$banned" && { echo "an image of Fluffy's preview or its icon set is shipped as $f"; return 1; }
+  done < <(find "$out/pkg" -type f)
+  return 0
+}
+scenarios_ok() {
+  python3 -I - <<'PY'
+import glob, xml.etree.ElementTree as ET
+ids = [e.text for e in ET.parse("About/About.xml").getroot().findall("incompatibleWith/li")]
+fixtures = {ET.parse(f).getroot().findtext("packageId").lower() for f in glob.glob("TestRunner/Fixtures/*/About/About.xml")}
+code = open("TestRunner/Source/Scenarios/IdentityModList.cs", encoding="utf-8").read()
+for i in ids:
+    assert i.lower() in fixtures, "no stand-in mod fixture for " + i
+    assert '"' + i + '"' in code, "IdentityModList does not check " + i
+assert "screenshot-mod-list-warns-when-fluffys-relations-tab-is-also-enabled" in code
+assert "every-existing-translation-loads-with-no-error" in open("TestRunner/Source/Scenarios/IdentityTranslations.cs", encoding="utf-8").read()
+PY
+}
+menu_name_ok() {
+  python3 -I - <<'PY'
+import re, xml.etree.ElementTree as ET
+name = {e.tag: e.text for e in ET.parse("Languages/English/Keyed/Keys.xml").getroot()}["Fluffy_Relations"]
+assert name == "Relations Tab (rimhunter)", "the Mod Options menu shows: " + repr(name)
+src = open("Source/Controller.cs", encoding="utf-8-sig").read()
+assert '"Fluffy_Relations".Translate()' in src, "SettingsCategory no longer uses the Fluffy_Relations key"
+about = ET.parse("About/About.xml").getroot().findtext("description")
+for path, text, pat in (("About/About.xml", about, r"Mod Options -> (.*?)\) you"), ("Readme.md", open("Readme.md", encoding="utf-8").read(), r"Mod Options -> (.*?)\) you"), ("WORKSHOP.md", open("WORKSHOP.md", encoding="utf-8").read(), r"Mod Options, (.*?)\)\. Each")):
+    m = re.search(pat, text)
+    assert m and m.group(1) == name, "%s names the menu %r, the game shows %r" % (path, m and m.group(1), name)
+PY
+}
+no_upload_id_ok() {
+  [ -z "$(git ls-files | grep -i 'PublishedFileId')" ] && [ ! -e About/PublishedFileId.txt ] &&
+  [ ! -e About/Manifest.xml ]
+}
+runner_ids_ok() {
+  python3 -I - <<'PY'
+import json, xml.etree.ElementTree as ET
+c = json.load(open("rimhunter-runner.json"))
+assert c["packageId"] == "rimhunter.relationstab"
+r = ET.parse("TestRunner/About/About.xml").getroot()
+assert [e.text for e in r.findall("loadAfter/li")] == ["rimhunter.relationstab"]
+PY
+}
+banned_image_hashes() {
+  { git ls-tree -r --name-only v4.1.124 -- Source/Images Source/preview.png About/Preview.png | while IFS= read -r f; do git show "v4.1.124:$f" | sha256sum | cut -d' ' -f1; done; } 
+}
+no_banned_image_ok() {
+  local banned f h
+  banned="$(banned_image_hashes)"
+  [ -n "$banned" ] || { echo "found no images to ban in v4.1.124"; return 1; }
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    h="$(sha256sum "$f" | cut -d' ' -f1)"
+    if grep -qx "$h" <<<"$banned"; then echo "$f is a copy of an image from v4.1.124's preview or Freepik/Flaticon set"; return 1; fi
+  done < <(git ls-files -z)
+  return 0
+}
+tree_clean() {
+  [ ! -e modinfo.json ] && [ ! -e Source/preview.png ] && [ ! -e Source/preview.svg.bak ] && [ ! -e Source/Images ] &&
+  [ ! -e Source/description.md ] && ! git ls-files | grep -qiE '(^|/)(preview\.svg|Images/preview)' &&
+  ! git ls-files -z | xargs -0 grep -IlE 'Freepik|Flaticon' 2>/dev/null | grep -qvE '^(scripts/test-identity|Readme.md|CHANGELOG.md|WORKSHOP.md)$'
+}
+readme_ok() {
+  grep -q 'Fluffy' Readme.md && grep -q 'https://github.com/fluffy-mods/RelationsTab' Readme.md && grep -q 'https://github.com/rimhunter/relations-tab' Readme.md &&
+  ! grep -qiE 'ukraine|coffee|headers\.karel-kroeze' Readme.md
+}
+
+check "About.xml identity and incompatible list" about_ok
+check "LICENSE unchanged from v4.1.124" license_unchanged
+check "modifications notice" modifications_ok
+check "CHANGELOG dated, names v4.1.124, lists identity, translation and preview changes" changelog_ok
+check "every language and key kept, every language loads from a known def type folder" languages_ok
+check "every string literal in Source is a translation key or a known non-drawn use" drawn_text_ok
+check "Fluffy's copyright lines kept in Source" copyright_ok
+check "own preview image, not Fluffy's" preview_ok
+check "Workshop page is BBCode and says what it must" workshop_ok
+check "package folder contents" package_ok
+check "no copy of v4.1.124's preview or Freepik/Flaticon images in the tree" no_banned_image_ok
+check "Mod Options menu name matches the page text" menu_name_ok
+check "mod list warning and translation scenarios" scenarios_ok
+check "runner names the new packageId" runner_ids_ok
+check "no Workshop id file and no Fluffy update manifest in the tree" no_upload_id_ok
+check "no personal email file or BY-NC or Flaticon preview source in the tree" tree_clean
+check "Readme credits Fluffy, no donations" readme_ok
+exit $fail

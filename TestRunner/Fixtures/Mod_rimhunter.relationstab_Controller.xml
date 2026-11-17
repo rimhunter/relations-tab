@@ -1,0 +1,7 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<SettingsBlock>
+	<ModSettings Class="Fluffy_Relations.Settings">
+		<OPINION_THRESHOLD_NEG>-20</OPINION_THRESHOLD_NEG>
+		<OPINION_THRESHOLD_POS>80</OPINION_THRESHOLD_POS>
+	</ModSettings>
+</SettingsBlock>
